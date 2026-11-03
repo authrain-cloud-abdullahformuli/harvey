@@ -31,6 +31,19 @@ def _normalize_start_url(url: str) -> str:
         url = f"https://{url}"
     return url
 
+def _scope_path(url: str) -> str:
+    """Path prefix a training URL is limited to ('' = whole site)."""
+    path = urlparse(url).path.rstrip("/")
+    return path
+
+
+def _in_scope(url: str, scope: str) -> bool:
+    if not scope:
+        return True
+    path = urlparse(url).path.rstrip("/")
+    return path == scope or path.startswith(scope + "/")
+
+
 # Fallback: pages to try if Cloudflare crawl is unavailable
 FALLBACK_PATHS = [
     "/", "/about", "/about-us", "/pricing", "/features", "/product",
@@ -201,13 +214,22 @@ class FallbackCrawler:
     """
 
     async def crawl(self, base_url: str, max_pages: int = 100) -> dict[str, str]:
-        """Recursively crawl a website by following internal links."""
+        """Recursively crawl a website by following internal links.
+
+        If base_url carries a path (e.g. https://x.com/orders), the crawl starts
+        there and stays inside that path instead of sweeping the whole site.
+        """
         pages: dict[str, str] = {}
         visited: set[str] = set()
-        domain = urlparse(base_url).netloc
+        parsed_base = urlparse(base_url)
+        domain = parsed_base.netloc
+        scope = _scope_path(base_url)
 
-        # Queue starts with priority paths, then discovered links
-        queue: list[str] = [urljoin(base_url, p) for p in FALLBACK_PATHS]
+        if scope:
+            queue: list[str] = [base_url]
+        else:
+            # Queue starts with priority paths, then discovered links
+            queue = [urljoin(base_url, p) for p in FALLBACK_PATHS]
 
         async with httpx.AsyncClient(
             timeout=15,
@@ -239,8 +261,10 @@ class FallbackCrawler:
 
                 # Discover new links from this page and add to queue
                 if html:
-                    new_links = self._extract_links(html, base_url, domain)
+                    new_links = self._extract_links(html, url, domain)
                     for link in new_links:
+                        if not _in_scope(link, scope):
+                            continue
                         norm = self._normalize_url(link)
                         if norm not in visited and link not in queue:
                             queue.append(link)
@@ -338,7 +362,9 @@ class Trainer:
             print(f"\nERROR: '{url}' doesn't look like a valid URL.")
             print("Try something like: https://yourcompany.com")
             return None
-        base_url = f"{parsed.scheme}://{domain}"
+        # Keep the path: 'uduu.com.br/orders' trains on /orders, not the whole site
+        base_url = f"{parsed.scheme}://{domain}{parsed.path.rstrip('/')}"
+        scope = _scope_path(base_url)
 
         logger.info(f"Training Harvey on {base_url}...")
         print(f"\n{'='*60}")
@@ -356,6 +382,10 @@ class Trainer:
             self.scraped_pages = await crawler.crawl(
                 base_url, max_pages=max_pages, depth=10
             )
+            if scope:
+                self.scraped_pages = {
+                    u: t for u, t in self.scraped_pages.items() if _in_scope(u, scope)
+                }
         else:
             print("[1/6] Crawling website (add CLOUDFLARE_ACCOUNT_ID and")
             print("      CLOUDFLARE_API_TOKEN to .env for deep JS-rendered crawling)...")
